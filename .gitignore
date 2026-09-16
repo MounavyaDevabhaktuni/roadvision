@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+data/processed/
+data/outputs/
+
+*.hevc
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+*.pt
+*.pth
+*.onnx
