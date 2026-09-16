@@ -1,0 +1,16 @@
+{
+  "camera_matrix": [
+    [800.0, 0.0, 582.0],
+    [0.0, 800.0, 437.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "distortion_coefficients": [
+    [0.0, 0.0, 0.0, 0.0, 0.0]
+  ],
+  "rms_error": null,
+  "image_width": 1164,
+  "image_height": 874,
+  "board_size": [9, 6],
+  "square_size_m": 0.024,
+  "calibration_status": "PROVISIONAL_NOT_CALIBRATED"
+}

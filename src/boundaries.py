@@ -1,345 +1,166 @@
-import numpy as np
 import cv2
+import numpy as np
 
 
-EDGE_NOT_VISIBLE = "EDGE_NOT_VISIBLE"
-EDGE_JUMP = "EDGE_JUMP"
-OCCLUSION = "OCCLUSION"
-
-DEFAULT_ROWS = [
-    0.55,
-    0.58,
-    0.61,
-    0.64,
-    0.67,
-    0.70,
-    0.73,
-    0.75,
-]
+DEFAULT_ROWS = [0.55, 0.60, 0.65, 0.70, 0.75]
 
 
 def _clean_mask(road_mask):
+    """Clean small holes/noise in the road mask."""
     mask = (road_mask > 0).astype(np.uint8)
 
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
-        (9, 9)
+        (7, 7)
     )
 
-    return cv2.morphologyEx(
+    mask = cv2.morphologyEx(
         mask,
         cv2.MORPH_CLOSE,
         kernel
     )
+
+    return mask
 
 
 def _row_edges(mask, y):
-    h, w = mask.shape
+    """Find the leftmost and rightmost road pixels on one row."""
 
-    if y < 0 or y >= h:
-        return None
+    row = mask[y, :].astype(np.uint8)
 
-    row = mask[y].copy()
+    row_2d = row.reshape(1, -1)
 
-    # Close small gaps in the road mask.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (31, 1)
-    )
+    kernel = np.ones((1, 21), dtype=np.uint8)
 
-    row = cv2.morphologyEx(
-        row.reshape(1, -1),
+    row_2d = cv2.morphologyEx(
+        row_2d,
         cv2.MORPH_CLOSE,
         kernel
-    )[0]
+    )
 
-    xs = np.flatnonzero(row > 0)
+    row = row_2d[0]
+
+    xs = np.where(row > 0)[0]
 
     if len(xs) < 20:
+        return None, None
+
+    return int(xs[0]), int(xs[-1])
+
+
+def _robust_line(points):
+    """Fit x = a*y + b while removing large outliers."""
+
+    if len(points) < 2:
         return None
 
-    # Find continuous regions.
-    runs = []
+    pts = np.asarray(points, dtype=np.float64)
 
-    start = xs[0]
-    previous = xs[0]
+    y = pts[:, 1]
+    x = pts[:, 0]
 
-    for x in xs[1:]:
-        if x > previous + 1:
-            if previous - start + 1 >= 20:
-                runs.append((start, previous))
-            start = x
+    keep = np.ones(len(points), dtype=bool)
 
-        previous = x
+    for _ in range(2):
+        if keep.sum() < 2:
+            return None
 
-    if previous - start + 1 >= 20:
-        runs.append((start, previous))
+        a, b = np.polyfit(y[keep], x[keep], 1)
 
-    if not runs:
+        predicted = a * y + b
+        residual = np.abs(x - predicted)
+
+        median_residual = np.median(residual[keep])
+        threshold = max(70.0, median_residual * 2.5)
+
+        keep = residual <= threshold
+
+    if keep.sum() < 2:
         return None
 
-    # Pick the widest substantial road region.
-    left, right = max(
-        runs,
-        key=lambda r: r[1] - r[0]
-    )
+    a, b = np.polyfit(y[keep], x[keep], 1)
 
-    if right - left < w * 0.20:
-        return None
-
-    return int(left), int(right)
+    return np.array([a, b], dtype=np.float64)
 
 
-def _remove_jumps(points, max_jump=90):
+def get_road_edges_multirow(road_mask, rows=None):
     """
-    Remove isolated boundary jumps.
+    Detect left/right road boundaries across multiple image rows.
 
-    The road boundary should move reasonably smoothly
-    from one image row to the next.
+    Boundary model:
+        x = a*y + b
     """
-
-    if len(points) < 3:
-        return points
-
-    points = sorted(
-        points,
-        key=lambda p: p[1]
-    )
-
-    result = [points[0]]
-
-    for point in points[1:]:
-
-        previous_x = result[-1][0]
-
-        if abs(point[0] - previous_x) <= max_jump:
-            result.append(point)
-
-    return result
-
-
-def _fit_boundary(points):
-    """
-    Fit x = a*y + b using RANSAC-like pair testing.
-
-    This prevents one bad segmentation row from
-    bending the boundary.
-    """
-
-    if len(points) < 3:
-        return None
-
-    points = np.asarray(
-        points,
-        dtype=float
-    )
-
-    best_inliers = None
-    best_count = -1
-    best_error = float("inf")
-
-    n = len(points)
-
-    # Try every pair as a candidate line.
-    for i in range(n):
-        for j in range(i + 1, n):
-
-            y1 = points[i, 1]
-            x1 = points[i, 0]
-
-            y2 = points[j, 1]
-            x2 = points[j, 0]
-
-            if y2 == y1:
-                continue
-
-            a = (x2 - x1) / (y2 - y1)
-            b = x1 - a * y1
-
-            predicted = a * points[:, 1] + b
-
-            residual = np.abs(
-                points[:, 0] - predicted
-            )
-
-            inliers = residual <= 35
-
-            count = int(inliers.sum())
-            error = float(residual[inliers].sum())
-
-            if (
-                count > best_count
-                or (
-                    count == best_count
-                    and error < best_error
-                )
-            ):
-                best_count = count
-                best_error = error
-                best_inliers = inliers
-
-    if best_inliers is None or best_count < 3:
-        return None
-
-    # Refit using only the good points.
-    good = points[best_inliers]
-
-    a, b = np.polyfit(
-        good[:, 1],
-        good[:, 0],
-        1
-    )
-
-    return np.array([a, b])
-
-
-def get_road_edges(
-    road_mask,
-    roi_fraction=0.70
-):
-
-    mask = _clean_mask(road_mask)
-
-    h, _ = mask.shape
-
-    y = int(
-        roi_fraction * h
-    )
-
-    result = _row_edges(
-        mask,
-        y
-    )
-
-    if result is None:
-        return (
-            None,
-            None,
-            [EDGE_NOT_VISIBLE]
-        )
-
-    return (
-        result[0],
-        result[1],
-        []
-    )
-
-
-def get_road_edges_multirow(
-    road_mask,
-    rows=None
-):
 
     if rows is None:
         rows = DEFAULT_ROWS
 
-    mask = _clean_mask(
-        road_mask
-    )
+    mask = _clean_mask(road_mask)
 
-    h, _ = mask.shape
+    height, width = mask.shape[:2]
 
     left_points = []
     right_points = []
 
-    for fraction in rows:
-
-        y = int(
-            fraction * h
-        )
-
-        result = _row_edges(
-            mask,
-            y
-        )
-
-        if result is None:
-            continue
-
-        left, right = result
-
-        left_points.append(
-            (left, y)
-        )
-
-        right_points.append(
-            (right, y)
-        )
-
-    # Remove sudden jumps independently.
-    left_points = _remove_jumps(
-        left_points,
-        max_jump=90
-    )
-
-    right_points = _remove_jumps(
-        right_points,
-        max_jump=90
-    )
-
     flags = []
 
-    if len(left_points) < 3:
-        flags.append(
-            EDGE_NOT_VISIBLE
-        )
+    for fraction in rows:
+        y = int(height * fraction)
 
-    if len(right_points) < 3:
-        flags.append(
-            EDGE_NOT_VISIBLE
-        )
+        if y < 0 or y >= height:
+            continue
 
-    left_line = _fit_boundary(
-        left_points
-    )
+        left_x, right_x = _row_edges(mask, y)
 
-    right_line = _fit_boundary(
-        right_points
-    )
+        if left_x is None or right_x is None:
+            continue
+
+        left_points.append((left_x, y))
+        right_points.append((right_x, y))
+
+    if len(left_points) < 2:
+        flags.append("LEFT_EDGE_NOT_VISIBLE")
+
+    if len(right_points) < 2:
+        flags.append("RIGHT_EDGE_NOT_VISIBLE")
+
+    left_curve = _robust_line(left_points)
+    right_curve = _robust_line(right_points)
+
+    if left_curve is None:
+        flags.append("LEFT_EDGE_FIT_FAILED")
+
+    if right_curve is None:
+        flags.append("RIGHT_EDGE_FIT_FAILED")
+
+    if not left_points or not right_points:
+        flags.append("EDGE_NOT_VISIBLE")
 
     return {
         "left_points": left_points,
         "right_points": right_points,
-        "left_curve": left_line,
-        "right_curve": right_line,
+        "left_curve": left_curve,
+        "right_curve": right_curve,
         "flags": flags,
     }
 
 
-def check_edge_continuity(
-    current_edge,
-    previous_edge,
-    max_jump_px
-):
+def get_road_edges(road_mask, roi_fraction=0.70):
+    """
+    Backwards-compatible single-row boundary detector.
+    """
 
-    if current_edge is None:
-        return [EDGE_NOT_VISIBLE]
+    mask = _clean_mask(road_mask)
 
-    if previous_edge is None:
-        return []
+    height, width = mask.shape[:2]
 
-    if abs(
-        current_edge - previous_edge
-    ) > max_jump_px:
-        return [EDGE_JUMP]
+    y = int(height * roi_fraction)
 
-    return []
+    left_x, right_x = _row_edges(mask, y)
 
+    flags = []
 
-def propagate_edge(
-    current_edge,
-    previous_edge,
-    missing_frames,
-    max_missing_frames=3
-):
+    if left_x is None or right_x is None:
+        flags.append("EDGE_NOT_VISIBLE")
+        return None, width - 1, flags
 
-    if current_edge is not None:
-        return current_edge, []
-
-    if (
-        previous_edge is not None
-        and missing_frames <= max_missing_frames
-    ):
-        return previous_edge, [OCCLUSION]
-
-    return None, [EDGE_NOT_VISIBLE]
+    return left_x, right_x, flags
