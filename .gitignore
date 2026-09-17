@@ -3,9 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 
-data/processed/
-data/outputs/
-
+data/
 *.hevc
 *.mp4
 *.mov
